@@ -1,0 +1,146 @@
+name: CI
+
+# Runs the StallSelector unit tests and a crowd simulation on every push and
+# pull request. The simulation results appear in the run's Summary tab.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: 4.4.1
+
+jobs:
+  test:
+    name: Tests and crowd simulation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Works with either layout:
+      #  - the project uploaded as a .zip (it gets extracted here), or
+      #  - the project unzipped in the repository.
+      - name: Find the Godot project (extracting the zip if needed)
+        id: project
+        run: |
+          file=$(find . -name project.godot -not -path "./.git/*" | head -n 1)
+          if [ -z "$file" ]; then
+            zip=$(find . -name "*.zip" -not -path "./.git/*" | sort | head -n 1)
+            if [ -z "$zip" ]; then
+              echo "::error::No project.godot and no .zip found in the repository."
+              exit 1
+            fi
+            echo "Extracting $zip"
+            dest="$RUNNER_TEMP/project"
+            mkdir -p "$dest"
+            unzip -q "$zip" -d "$dest"
+            file=$(find "$dest" -name project.godot -not -path "*/.godot/*" | head -n 1)
+            if [ -z "$file" ]; then
+              echo "::error::$zip does not contain a project.godot."
+              exit 1
+            fi
+          fi
+          dir=$(cd "$(dirname "$file")" && pwd)
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Godot project: $dir"
+
+      - name: Cache Godot
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: ~/godot
+          key: godot-${{ env.GODOT_VERSION }}-linux-x86_64
+
+      - name: Download Godot
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/godot
+          url="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          curl -fsSL -o /tmp/godot.zip "$url"
+          unzip -q /tmp/godot.zip -d /tmp/godot
+          mv /tmp/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot/godot
+          chmod +x ~/godot/godot
+
+      - name: Add Godot to PATH
+        run: |
+          echo "$HOME/godot" >> "$GITHUB_PATH"
+          ~/godot/godot --headless --version
+
+      - name: Import project (registers class_name scripts)
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: godot --headless --import 2>&1 | tee import.log
+
+      - name: Check for script errors
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          if grep -E "SCRIPT ERROR|Parse Error|Failed to load script" import.log; then
+            echo "::error::GDScript errors during import (see above)."
+            exit 1
+          fi
+
+      - name: Run StallSelector tests
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set +e
+          godot --headless -s res://tools/test_stall_selector.gd 2>&1 | tee tests.log
+          code=${PIPESTATUS[0]}
+          set -e
+          # Godot can exit 0 after a script error, so check the log as well.
+          if grep -E "SCRIPT ERROR|Parse Error" tests.log; then
+            echo "::error::Script error while running tests."
+            exit 1
+          fi
+          if [ "$code" -ne 0 ] || grep -q "^FAIL:" tests.log; then
+            echo "::error::Unit tests failed."
+            exit 1
+          fi
+          grep -E "checks, 0 failed" tests.log
+
+      - name: Run crowd simulation
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          godot --headless -s res://tools/crowd_sim.gd -- --compare --curve 2>&1 | tee sim.log
+          godot --headless -s res://tools/crowd_sim.gd -- --pitch=quiet_corner --keep-grill-hot 2>&1 | tee -a sim.log
+          if grep -E "SCRIPT ERROR|Parse Error" sim.log; then
+            echo "::error::Script error while running the simulation."
+            exit 1
+          fi
+
+      - name: Write results to the run summary
+        if: always()
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          {
+            echo "## Follow the Smoke: CI results"
+            echo
+            echo "**Tests:** $(grep -E 'checks, [0-9]+ failed' tests.log 2>/dev/null || echo 'did not run')"
+            echo
+            echo "### Crowd simulation"
+            echo '```'
+            grep -vE "^Godot Engine" sim.log 2>/dev/null || echo "did not run"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: |
+            ${{ steps.project.outputs.dir }}/import.log
+            ${{ steps.project.outputs.dir }}/tests.log
+            ${{ steps.project.outputs.dir }}/sim.log
+          if-no-files-found: ignore
+          retention-days: 14
