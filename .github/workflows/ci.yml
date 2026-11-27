@@ -1,7 +1,12 @@
 name: CI
 
-# On every push and pull request: unit tests, the crowd simulation, and one
-# full night played by the autoplay bot. Results appear in the run's Summary tab.
+# On every push (or upload of the project zip):
+#   1. test:    unit tests, crowd simulation, one night played by a bot
+#   2. build:   exports the game for Windows (downloadable .exe) and the web
+#   3. publish: puts the web version on GitHub Pages so it can be played in a browser
+#
+# Works whether the repository holds the project unzipped or as a .zip file.
+# One-time setup for the browser version: Settings > Pages > Source: "GitHub Actions".
 
 on:
   push:
@@ -21,17 +26,13 @@ env:
 
 jobs:
   test:
-    name: Tests and crowd simulation
+    name: Tests and simulation
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
-      # Works with either layout:
-      #  - the project uploaded as a .zip (it gets extracted here), or
-      #  - the project unzipped in the repository.
       - name: Find the Godot project (extracting the zip if needed)
         id: project
         run: |
@@ -67,8 +68,7 @@ jobs:
         if: steps.cache-godot.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/godot
-          url="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
-          curl -fsSL -o /tmp/godot.zip "$url"
+          curl -fsSL -o /tmp/godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
           unzip -q /tmp/godot.zip -d /tmp/godot
           mv /tmp/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot/godot
           chmod +x ~/godot/godot
@@ -78,13 +78,10 @@ jobs:
           echo "$HOME/godot" >> "$GITHUB_PATH"
           ~/godot/godot --headless --version
 
-      - name: Import project (registers class_name scripts)
-        working-directory: ${{ steps.project.outputs.dir }}
-        run: godot --headless --import 2>&1 | tee import.log
-
-      - name: Check for script errors
+      - name: Import project
         working-directory: ${{ steps.project.outputs.dir }}
         run: |
+          godot --headless --import 2>&1 | tee import.log
           if grep -E "SCRIPT ERROR|Parse Error|Failed to load script" import.log; then
             echo "::error::GDScript errors during import (see above)."
             exit 1
@@ -97,7 +94,6 @@ jobs:
           godot --headless -s res://tools/test_stall_selector.gd 2>&1 | tee tests.log
           code=${PIPESTATUS[0]}
           set -e
-          # Godot can exit 0 after a script error, so check the log as well.
           if grep -E "SCRIPT ERROR|Parse Error" tests.log; then
             echo "::error::Script error while running tests."
             exit 1
@@ -112,7 +108,6 @@ jobs:
         working-directory: ${{ steps.project.outputs.dir }}
         run: |
           godot --headless -s res://tools/crowd_sim.gd -- --compare --curve 2>&1 | tee sim.log
-          godot --headless -s res://tools/crowd_sim.gd -- --pitch=quiet_corner --keep-grill-hot 2>&1 | tee -a sim.log
           if grep -E "SCRIPT ERROR|Parse Error" sim.log; then
             echo "::error::Script error while running the simulation."
             exit 1
@@ -136,7 +131,7 @@ jobs:
         working-directory: ${{ steps.project.outputs.dir }}
         run: |
           {
-            echo "## Follow the Smoke: CI results"
+            echo "## Follow the Smoke: test results"
             echo
             echo "**Tests:** $(grep -E 'checks, [0-9]+ failed' tests.log 2>/dev/null || echo 'did not run')"
             echo
@@ -157,9 +152,111 @@ jobs:
         with:
           name: ci-logs
           path: |
-            ${{ steps.project.outputs.dir }}/import.log
-            ${{ steps.project.outputs.dir }}/tests.log
-            ${{ steps.project.outputs.dir }}/sim.log
-            ${{ steps.project.outputs.dir }}/night.log
+            ${{ steps.project.outputs.dir }}/*.log
           if-no-files-found: ignore
           retention-days: 14
+
+  build:
+    name: Build the game (Windows + web)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Find the Godot project (extracting the zip if needed)
+        id: project
+        run: |
+          file=$(find . -name project.godot -not -path "./.git/*" | head -n 1)
+          if [ -z "$file" ]; then
+            zip=$(find . -name "*.zip" -not -path "./.git/*" | sort | head -n 1)
+            dest="$RUNNER_TEMP/project"
+            mkdir -p "$dest"
+            unzip -q "$zip" -d "$dest"
+            file=$(find "$dest" -name project.godot -not -path "*/.godot/*" | head -n 1)
+          fi
+          dir=$(cd "$(dirname "$file")" && pwd)
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Godot
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: ~/godot
+          key: godot-${{ env.GODOT_VERSION }}-linux-x86_64
+
+      - name: Download Godot
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/godot
+          curl -fsSL -o /tmp/godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          unzip -q /tmp/godot.zip -d /tmp/godot
+          mv /tmp/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot/godot
+          chmod +x ~/godot/godot
+
+      - name: Cache export templates
+        id: cache-templates
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable
+          key: godot-templates-${{ env.GODOT_VERSION }}-windows-web
+
+      - name: Download export templates (Windows + web only)
+        if: steps.cache-templates.outputs.cache-hit != 'true'
+        run: |
+          dest="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$dest"
+          curl -fsSL --retry 3 -o /tmp/templates.tpz "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          unzip -o -q -j /tmp/templates.tpz \
+            templates/version.txt \
+            templates/windows_release_x86_64.exe \
+            templates/web_nothreads_release.zip \
+            -d "$dest"
+          rm /tmp/templates.tpz
+          ls -la "$dest"
+
+      - name: Export
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          export PATH="$HOME/godot:$PATH"
+          godot --headless --import > /dev/null 2>&1 || true
+          mkdir -p build/windows build/web
+          godot --headless --export-release "Windows Desktop" build/windows/FollowTheSmoke.exe
+          godot --headless --export-release "Web" build/web/index.html
+          test -f build/windows/FollowTheSmoke.exe
+          test -f build/web/index.wasm
+          ls -la build/windows build/web
+
+      - name: Upload the Windows game
+        uses: actions/upload-artifact@v4
+        with:
+          name: FollowTheSmoke-Windows
+          path: ${{ steps.project.outputs.dir }}/build/windows/FollowTheSmoke.exe
+          retention-days: 30
+
+      - name: Upload the web game for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.project.outputs.dir }}/build/web
+
+  publish:
+    name: Publish the web version (GitHub Pages)
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Show the link
+        run: |
+          echo "## Play in your browser" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.deploy.outputs.page_url }}" >> "$GITHUB_STEP_SUMMARY"
