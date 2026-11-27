@@ -1,7 +1,7 @@
 name: CI
 
-# Runs the StallSelector unit tests and a crowd simulation on every push and
-# pull request. The simulation results appear in the run's Summary tab.
+# On every push and pull request: unit tests, the crowd simulation, and one
+# full night played by the autoplay bot. Results appear in the run's Summary tab.
 
 on:
   push:
@@ -118,6 +118,19 @@ jobs:
             exit 1
           fi
 
+      - name: Play one night with the autoplay bot
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          timeout 300 godot --headless -- --autoplay --fast --seed=1 --quit-after-report 2>&1 | tee night.log
+          if grep -E "SCRIPT ERROR|Parse Error" night.log; then
+            echo "::error::Script error while playing a night."
+            exit 1
+          fi
+          if ! grep -q "NIGHT REPORT" night.log; then
+            echo "::error::The night never finished (no report)."
+            exit 1
+          fi
+
       - name: Write results to the run summary
         if: always()
         working-directory: ${{ steps.project.outputs.dir }}
@@ -126,6 +139,11 @@ jobs:
             echo "## Follow the Smoke: CI results"
             echo
             echo "**Tests:** $(grep -E 'checks, [0-9]+ failed' tests.log 2>/dev/null || echo 'did not run')"
+            echo
+            echo "### One night played by the autoplay bot"
+            echo '```'
+            grep -vE "^Godot Engine" night.log 2>/dev/null || echo "did not run"
+            echo '```'
             echo
             echo "### Crowd simulation"
             echo '```'
@@ -142,5 +160,6 @@ jobs:
             ${{ steps.project.outputs.dir }}/import.log
             ${{ steps.project.outputs.dir }}/tests.log
             ${{ steps.project.outputs.dir }}/sim.log
+            ${{ steps.project.outputs.dir }}/night.log
           if-no-files-found: ignore
           retention-days: 14
